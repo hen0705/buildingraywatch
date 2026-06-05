@@ -71,13 +71,19 @@ export default function MapPage() {
     if (!m) return;
     try {
       const bounds = m.getBounds();
-      const { data } = await supabase.rpc('get_sightings_in_bounds', {
-        min_lat: bounds.getSouth(), max_lat: bounds.getNorth(),
-        min_lng: bounds.getWest(), max_lng: bounds.getEast(),
-      }).catch(() => ({ data: null }));
+      let rows: Record<string, unknown>[] | null = null;
+
+      try {
+        const { data } = await supabase.rpc('get_sightings_in_bounds', {
+          min_lat: bounds.getSouth(), max_lat: bounds.getNorth(),
+          min_lng: bounds.getWest(), max_lng: bounds.getEast(),
+        });
+        rows = data;
+      } catch {
+        // RPC not available, fall through to fallback
+      }
 
       // Fallback: fetch all approved
-      let rows = data;
       if (!rows) {
         const res = await supabase.from('sightings').select('*').eq('status', 'approved');
         rows = res.data ?? [];
