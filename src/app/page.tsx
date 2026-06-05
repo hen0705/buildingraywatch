@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import Nav from '@/components/Nav';
 import { supabase } from '@/lib/supabase';
@@ -44,7 +44,7 @@ export default function HomePage() {
             cell_lng: (d.cell_lng as number) ?? parseFloat(d.lng as string),
             cell_size_deg: (d.cell_size_deg as number) ?? 0.15,
           }))
-          .filter((d: Sighting) => d.submitted_at) as Sighting[];
+          .filter((d) => d.submitted_at) as Sighting[];
         setAllSightings(normalized);
         const ys = [...new Set(normalized.map((s) => GeneralizationEngine.getYear(s.submitted_at)))].sort((a, b) => b - a);
         setYears(ys);
