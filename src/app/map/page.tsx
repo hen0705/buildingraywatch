@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import Link from 'next/link';
 import { supabase } from '@/lib/supabase';
+import { fetchINatSightings } from '@/lib/inaturalist';
 import { GeneralizationEngine, getDefaultFishingWeight } from '@/lib/core';
 import type { Sighting, RiskZone, Season } from '@/types';
 import styles from './map.module.css';
@@ -17,21 +18,23 @@ export default function MapPage() {
     hotspot: L.LayerGroup | null;
     risk: L.LayerGroup | null;
     dots: L.LayerGroup | null;
-  }>({ hotspot: null, risk: null, dots: null });
+    inat: L.LayerGroup | null;
+  }>({ hotspot: null, risk: null, dots: null, inat: null });
 
   const [allSightings, setAllSightings] = useState<Sighting[]>([]);
+  const [inatSightings, setInatSightings] = useState<Sighting[]>([]);
   const [loading, setLoading] = useState(true);
+  const [inatLoading, setInatLoading] = useState(false);
   const [season, setSeason] = useState<Season | 'all'>('all');
   const [selectedYear, setSelectedYear] = useState<number | 'all'>('all');
   const [years, setYears] = useState<number[]>([]);
-  const [layers, setLayers] = useState({ hotspot: true, risk: true, dots: true, photos: false });
+  const [layers, setLayers] = useState({ hotspot: true, risk: true, dots: true, photos: false, inat: true });
   const [stats, setStats] = useState({ sightings: 0, rays: 0, zones: 0, high: 0 });
 
   // Init Leaflet (client-side only)
   useEffect(() => {
     if (typeof window === 'undefined' || leafRef.current) return;
     import('leaflet').then((L) => {
-      // Fix default marker icons
       // @ts-expect-error Leaflet icon hack
       delete L.Icon.Default.prototype._getIconUrl;
       L.Icon.Default.mergeOptions({
@@ -54,12 +57,14 @@ export default function MapPage() {
       layerRefs.current.hotspot = L.layerGroup().addTo(map);
       layerRefs.current.risk = L.layerGroup().addTo(map);
       layerRefs.current.dots = L.layerGroup().addTo(map);
+      layerRefs.current.inat = L.layerGroup().addTo(map);
       leafRef.current = map;
 
       loadData(map);
-      map.on('moveend', () => loadData(map));
+      loadINat(map);
+      map.on('moveend', () => { loadData(map); loadINat(map); });
     });
-    // Load Leaflet CSS
+
     const link = document.createElement('link');
     link.rel = 'stylesheet';
     link.href = 'https://unpkg.com/leaflet/dist/leaflet.css';
@@ -83,7 +88,6 @@ export default function MapPage() {
         // RPC not available, fall through to fallback
       }
 
-      // Fallback: fetch all approved
       if (!rows) {
         const res = await supabase.from('sightings').select('*').eq('status', 'approved');
         rows = res.data ?? [];
@@ -99,6 +103,7 @@ export default function MapPage() {
             count: parseInt(d.count as string, 10) || 1,
             submitted_at: (d.submitted_at as string) || new Date().toISOString(),
             photo_urls: Array.isArray(d.photo_urls) ? d.photo_urls : null,
+            source: 'raywatch' as const,
           } as Sighting;
         })
         .filter((s): s is Sighting => s !== null);
@@ -111,11 +116,29 @@ export default function MapPage() {
     }
   }, []);
 
-  // Redraw whenever filter state changes
+  const loadINat = useCallback(async (map?: L.Map) => {
+    const m = map || leafRef.current;
+    if (!m) return;
+    setInatLoading(true);
+    try {
+      const bounds = m.getBounds();
+      const sightings = await fetchINatSightings(
+        bounds.getSouth(), bounds.getWest(),
+        bounds.getNorth(), bounds.getEast()
+      );
+      setInatSightings(sightings);
+    } catch (e) {
+      console.error('iNaturalist fetch failed:', e);
+    } finally {
+      setInatLoading(false);
+    }
+  }, []);
+
+  // Redraw whenever filter state or data changes
   useEffect(() => {
-    if (!leafRef.current || allSightings.length === 0) return;
+    if (!leafRef.current) return;
     import('leaflet').then((L) => redraw(L));
-  }, [allSightings, season, selectedYear, layers]);
+  }, [allSightings, inatSightings, season, selectedYear, layers]);
 
   function getFiltered(): Sighting[] {
     let s = allSightings;
@@ -129,41 +152,39 @@ export default function MapPage() {
     refs.hotspot?.clearLayers();
     refs.risk?.clearLayers();
     refs.dots?.clearLayers();
+    refs.inat?.clearLayers();
 
     const filtered = getFiltered();
     const zones: RiskZone[] = filtered.length
       ? GeneralizationEngine.process(filtered, getDefaultFishingWeight)
       : [];
 
-    const visZones = zones;
     const CELL_DEG = 0.15;
 
     // Hotspot / risk rectangles
     if (layers.hotspot || layers.risk) {
-      visZones.forEach((z) => {
+      zones.forEach((z) => {
         const half = CELL_DEG / 2;
         const bounds: L.LatLngBoundsExpression = [
           [z.cell_lat - half, z.cell_lng - half],
           [z.cell_lat + half, z.cell_lng + half],
         ];
         if (layers.hotspot) {
-          const opacity = 0.08 + z.kde_intensity * 0.35;
           L.rectangle(bounds, {
             color: '#4fb8a0', fillColor: '#4fb8a0',
-            fillOpacity: opacity, weight: 0,
+            fillOpacity: 0.08 + z.kde_intensity * 0.35, weight: 0,
           }).addTo(refs.hotspot!);
         }
         if (layers.risk) {
           const color = RISK_COLORS[z.risk_tier];
           L.rectangle(bounds, {
-            color, fillColor: color,
-            fillOpacity: 0.18, weight: 1, opacity: 0.4,
+            color, fillColor: color, fillOpacity: 0.18, weight: 1, opacity: 0.4,
           }).addTo(refs.risk!);
         }
       });
     }
 
-    // Sighting dots
+    // RayWatch sighting dots (teal)
     if (layers.dots) {
       const dotSightings = layers.photos ? filtered.filter((s) => s.photo_urls?.length) : filtered;
       dotSightings.forEach((s) => {
@@ -190,21 +211,44 @@ export default function MapPage() {
       });
     }
 
+    // iNaturalist dots (amber)
+    if (layers.inat) {
+      inatSightings.forEach((s) => {
+        const circle = L.circleMarker([s.lat, s.lng], {
+          radius: 5,
+          fillColor: '#f0b429',
+          color: 'rgba(255,255,255,0.3)',
+          weight: 1,
+          fillOpacity: 0.8,
+        });
+        const date = new Date(s.submitted_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+        circle.bindPopup(`
+          <div style="font-family:'DM Sans',sans-serif;color:#e8f4f0;min-width:200px">
+            <div style="font-size:.7rem;background:rgba(240,180,41,0.15);border:1px solid rgba(240,180,41,0.3);border-radius:4px;padding:2px 8px;display:inline-block;margin-bottom:6px;color:#f0b429">iNaturalist</div>
+            <strong style="font-family:'Syne',sans-serif;display:block">Cownose Ray</strong>
+            <hr style="border-color:rgba(79,184,160,0.2);margin:6px 0"/>
+            <div style="font-size:.8rem;color:rgba(232,244,240,.6)">Date: <span style="color:#e8f4f0">${date}</span></div>
+            ${s.place_guess ? `<div style="font-size:.8rem;color:rgba(232,244,240,.6)">Location: <span style="color:#e8f4f0">${s.place_guess}</span></div>` : ''}
+            <div style="font-size:.8rem;color:rgba(232,244,240,.6)">Quality: <span style="color:#e8f4f0">${s.quality_grade ?? 'unknown'}</span></div>
+            ${s.inat_url ? `<a href="${s.inat_url}" target="_blank" rel="noopener" style="font-size:.75rem;color:#f0b429;display:block;margin-top:6px">View on iNaturalist →</a>` : ''}
+          </div>
+        `);
+        circle.addTo(refs.inat!);
+      });
+    }
+
     // Update stats
     const totalRays = filtered.reduce((n, s) => n + (s.count || 1), 0);
     setStats({
-      sightings: filtered.length,
+      sightings: filtered.length + (layers.inat ? inatSightings.length : 0),
       rays: totalRays,
-      zones: visZones.length,
-      high: visZones.filter((z) => z.risk_tier === 'high').length,
+      zones: zones.length,
+      high: zones.filter((z) => z.risk_tier === 'high').length,
     });
   }
 
   function toggleLayer(name: keyof typeof layers) {
-    setLayers((prev) => {
-      const next = { ...prev, [name]: !prev[name] };
-      return next;
-    });
+    setLayers((prev) => ({ ...prev, [name]: !prev[name] }));
   }
 
   function zoomIn() { leafRef.current?.zoomIn(); }
@@ -261,6 +305,15 @@ export default function MapPage() {
                 onClick={() => toggleLayer('photos')}
               />
             </div>
+            <div className={styles.layerRow}>
+              <span className={styles.layerName} style={{ color: '#f0b429' }}>
+                iNaturalist {inatLoading ? '…' : `(${inatSightings.length})`}
+              </span>
+              <button
+                className={`${styles.toggle} ${layers.inat ? styles.toggleOn : ''}`}
+                onClick={() => toggleLayer('inat')}
+              />
+            </div>
             <span className={`${styles.ctrlLabel} ${styles.ctrlLabelMt}`}>Season</span>
             <select
               className={styles.mapSelect}
@@ -297,6 +350,15 @@ export default function MapPage() {
               {tier.charAt(0).toUpperCase() + tier.slice(1)}
             </div>
           ))}
+          <div className={styles.legendTitle} style={{ marginTop: 10 }}>Sources</div>
+          <div className={styles.legendRow}>
+            <div className={styles.legendSwatch} style={{ background: '#4fb8a0' }} />
+            RayWatch
+          </div>
+          <div className={styles.legendRow}>
+            <div className={styles.legendSwatch} style={{ background: '#f0b429' }} />
+            iNaturalist
+          </div>
         </div>
 
         {/* Zoom */}
